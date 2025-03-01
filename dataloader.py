@@ -1,45 +1,46 @@
-import os, pickle, random
+import os, random
+import pickle
 from glob import glob
 
 import torch
 import numpy as np
-
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 IDX_TO_KEY = {
-  0: 'A',
-  1: 'A#',
-  2: 'B',
-  3: 'C',
-  4: 'C#',
-  5: 'D',
-  6: 'D#',
-  7: 'E',
-  8: 'F',
-  9: 'F#',
-  10: 'G',
-  11: 'G#'
+  9: 'A',
+  10: 'A#',
+  11: 'B',
+  0: 'C',
+  1: 'C#',
+  2: 'D',
+  3: 'D#',
+  4: 'E',
+  5: 'F',
+  6: 'F#',
+  7: 'G',
+  8: 'G#'
 }
 KEY_TO_IDX = {
   v:k for k, v in IDX_TO_KEY.items()
 }
+composer_dict = {"Bach":1, "Mozart":2, "Beethoven":3}
 
 def get_chord_tone(chord_event):
   tone = chord_event['value'].split('_')[0]
-  return tone
+  return int(tone)
 
 def transpose_chord(chord_event, n_keys):
-  if chord_event['value'] == 'N_N':
+  if chord_event['value'] == 'None_None' or chord_event['value'] == 'Conti_Conti':
     return chord_event
 
-  orig_tone = get_chord_tone(chord_event)
-  orig_tone_idx = KEY_TO_IDX[orig_tone]
+  orig_tone_idx = get_chord_tone(chord_event)
   new_tone_idx = (orig_tone_idx + 12 + n_keys) % 12
   new_chord_value = chord_event['value'].replace(
-    '{}_'.format(orig_tone), '{}_'.format(IDX_TO_KEY[new_tone_idx])
+    '{}_'.format(orig_tone_idx), '{}_'.format(new_tone_idx)
   )
   new_chord_event = {'name': chord_event['name'], 'value': new_chord_value}
-  # print ('keys={}. {} --> {}'.format(n_keys, chord_event, new_chord_event))
+  
+  # print ('[n key = {:4}] {} --> {}'.format(n_keys, chord_event['value'], new_chord_event['value']))
 
   return new_chord_event
 
@@ -60,10 +61,10 @@ def transpose_events(raw_events, n_keys):
       transposed_raw_events.append(
         {'name': ev['name'], 'value': ev['value'] + n_keys}
       )
-    elif ev['name'] == 'Chord':
-      transposed_raw_events.append(
-        transpose_chord(ev, n_keys)
-      )
+    # elif ev['name'] == 'Chord':
+    #   transposed_raw_events.append(
+    #     transpose_chord(ev, n_keys)
+    #   )
     else:
       transposed_raw_events.append(ev)
 
@@ -84,33 +85,31 @@ def convert_event(event_seq, event2idx, to_ndarr=True):
   else:
     return event_seq
 
-class REMIFullSongTransformerDataset(Dataset):
+class REMISkylineToMidiVAEDataset(Dataset):
   def __init__(self, data_dir, vocab_file, 
-               model_enc_seqlen=128, model_dec_seqlen=1280, model_max_bars=16,
+               model_dec_seqlen=10240, model_max_bars=None,
                pieces=[], do_augment=True, augment_range=range(-6, 7), 
-               min_pitch=22, max_pitch=107, pad_to_same=True, use_attr_cls=True,
-               appoint_st_bar=None, dec_end_pad_value=None):
+               min_pitch=21, max_pitch=108, pad_to_same=True,
+               appoint_st_bar=None, dec_end_pad_value=None,
+               use_chord_mhot=False
+              ):
     self.vocab_file = vocab_file
     self.read_vocab()
 
-    self.data_dir = data_dir
-    self.pieces = pieces
-    self.build_dataset()
-
-    self.model_enc_seqlen = model_enc_seqlen
     self.model_dec_seqlen = model_dec_seqlen
     self.model_max_bars = model_max_bars
+    self.data_dir = data_dir
+    self.pieces = pieces
+    self.use_chord_mhot = use_chord_mhot
+    self.build_dataset()
 
     self.do_augment = do_augment
     self.augment_range = augment_range
     self.min_pitch, self.max_pitch = min_pitch, max_pitch
     self.pad_to_same = pad_to_same
-    self.use_attr_cls = use_attr_cls
 
     self.appoint_st_bar = appoint_st_bar
-    if dec_end_pad_value is None:
-      self.dec_end_pad_value = self.pad_token
-    elif dec_end_pad_value == 'EOS':
+    if dec_end_pad_value == 'EOS':
       self.dec_end_pad_value = self.eos_token
     else:
       self.dec_end_pad_value = self.pad_token
@@ -131,54 +130,69 @@ class REMIFullSongTransformerDataset(Dataset):
     else:
       self.pieces = sorted( [os.path.join(self.data_dir, p) for p in self.pieces] )
 
-    self.piece_bar_pos = []
+    self.piece_skyline_pos = []
+    self.piece_midi_pos = []
+    self.piece_admissible_stbars = []
 
     for i, p in enumerate(self.pieces):
-      bar_pos, p_evs = pickle_load(p)
+      piece_data = pickle_load(p)
+      skyline_pos, midi_pos = piece_data[0], piece_data[1]
+      piece_evs = piece_data[2]
       if not i % 200:
         print ('[preparing data] now at #{}'.format(i))
-      if bar_pos[-1] == len(p_evs):
-        print ('piece {}, got appended bar markers'.format(p))
-        bar_pos = bar_pos[:-1]
-      if len(p_evs) - bar_pos[-1] == 2:
-        # got empty trailing bar
-        bar_pos = bar_pos[:-1]
 
-      bar_pos.append(len(p_evs))
+      self.piece_skyline_pos.append(skyline_pos)
+      self.piece_midi_pos.append(midi_pos)
 
-      self.piece_bar_pos.append(bar_pos)
+      if len(piece_evs) <= self.model_dec_seqlen:
+        self.piece_admissible_stbars.append([0])
+      else:
+        _admissible_stbars = []
+        for bar in range(len(self.piece_skyline_pos[-1])):
+          if len(piece_evs) - self.piece_skyline_pos[-1][bar][0] >= 0.5 * self.model_dec_seqlen:
+            _admissible_stbars.append(bar)
+          else:
+            break
+        self.piece_admissible_stbars.append(_admissible_stbars)
 
   def get_sample_from_file(self, piece_idx):
-    piece_evs = pickle_load(self.pieces[piece_idx])[1]
-    if len(self.piece_bar_pos[piece_idx]) > self.model_max_bars and self.appoint_st_bar is None:
-      picked_st_bar = random.choice(
-        range(len(self.piece_bar_pos[piece_idx]) - self.model_max_bars)
-      )
-    elif self.appoint_st_bar is not None and self.appoint_st_bar < len(self.piece_bar_pos[piece_idx]) - self.model_max_bars:
-      picked_st_bar = self.appoint_st_bar
+    if self.use_chord_mhot:
+      piece_evs, piece_chords = pickle_load(self.pieces[piece_idx])[-2:]
     else:
-      picked_st_bar = 0
+      piece_evs = pickle_load(self.pieces[piece_idx])[2]
 
-    piece_bar_pos = self.piece_bar_pos[piece_idx]
+    piece_skyline_pos = self.piece_skyline_pos[piece_idx]
+    piece_midi_pos = self.piece_midi_pos[piece_idx]
+    # n_bars = len(piece_midi_pos)
+    st_bar = random.choice(self.piece_admissible_stbars[ piece_idx ])
 
-    if len(piece_bar_pos) > self.model_max_bars:
-      piece_evs = piece_evs[ piece_bar_pos[picked_st_bar] : piece_bar_pos[picked_st_bar + self.model_max_bars] ]
-      picked_bar_pos = np.array(piece_bar_pos[ picked_st_bar : picked_st_bar + self.model_max_bars ]) - piece_bar_pos[picked_st_bar]
-      n_bars = self.model_max_bars
+    if not self.use_chord_mhot:
+      return piece_evs, piece_skyline_pos, piece_midi_pos, st_bar
     else:
-      picked_bar_pos = np.array(piece_bar_pos + [piece_bar_pos[-1]] * (self.model_max_bars - len(piece_bar_pos)))
-      n_bars = len(piece_bar_pos)
-      assert len(picked_bar_pos) == self.model_max_bars
-
-    return piece_evs, picked_st_bar, picked_bar_pos, n_bars
+      return piece_evs, piece_skyline_pos, piece_midi_pos, piece_chords, st_bar
 
   def pad_sequence(self, seq, maxlen, pad_value=None):
     if pad_value is None:
       pad_value = self.pad_token
 
-    seq.extend( [pad_value for _ in range(maxlen- len(seq))] )
+    if len(seq) < maxlen:
+      seq.extend( [pad_value for _ in range(maxlen- len(seq))] )
 
     return seq
+
+  def pad_chords(self, chords, maxlen):
+    if chords is None:
+      return None
+
+    if len(chords) >= maxlen:
+      return chords
+
+    chords = np.concatenate(
+      (chords, np.zeros((maxlen - len(chords), 12))),
+      axis=0
+    )
+
+    return chords
 
   def pitch_augment(self, bar_events):
     bar_min_pitch, bar_max_pitch = check_extreme_pitch(bar_events)
@@ -190,32 +204,42 @@ class REMIFullSongTransformerDataset(Dataset):
     augmented_bar_events = transpose_events(bar_events, n_keys)
     return augmented_bar_events
 
-  def get_attr_classes(self, piece, st_bar):
-    polyph_cls = pickle_load(os.path.join(self.data_dir, 'attr_cls/polyph', piece))[st_bar : st_bar + self.model_max_bars]
-    rfreq_cls = pickle_load(os.path.join(self.data_dir, 'attr_cls/rhythm', piece))[st_bar : st_bar + self.model_max_bars]
+  def make_target_and_mask(self, inp_tokens, skyline_pos, midi_pos, st_bar):
+    tgt = np.full_like(inp_tokens, fill_value=self.pad_token)
+    track_mask = np.zeros_like(inp_tokens)
 
-    polyph_cls.extend([0 for _ in range(self.model_max_bars - len(polyph_cls))])
-    rfreq_cls.extend([0 for _ in range(self.model_max_bars - len(rfreq_cls))])
+    for bidx in range(st_bar, len(skyline_pos)):
+      offset =  - skyline_pos[st_bar][0] + 1 
 
-    assert len(polyph_cls) == self.model_max_bars
-    assert len(rfreq_cls) == self.model_max_bars
+      track_mask[ midi_pos[bidx][0] + offset : midi_pos[bidx][1] + offset ] = 1
+      if bidx != len(skyline_pos) - 1:
+        tgt[ midi_pos[bidx][0] + offset : midi_pos[bidx][1] + offset ] = inp_tokens[ midi_pos[bidx][0] + 1 + offset: midi_pos[bidx][1] + 1 + offset ]
+      else:
+        tgt[ midi_pos[bidx][0] + offset : midi_pos[bidx][1] - 1 + offset ] = inp_tokens[ midi_pos[bidx][0] + 1 + offset : midi_pos[bidx][1] + offset ]
+        tgt[ midi_pos[bidx][1] - 1 + offset ] = self.eos_token
 
-    return polyph_cls, rfreq_cls
-
-  def get_encoder_input_data(self, bar_positions, bar_events):
+    return tgt, track_mask
+  
+  def make_encinp_and_mask(self, inp_tokens, skyline_pos, midi_pos, st_bar):
+    # encoder input and mask is in shape [# of bars, encode seq length]
+    # pad midi part of the original sequence (assume already truncated)
     assert len(bar_positions) == self.model_max_bars + 1
     enc_padding_mask = np.ones((self.model_max_bars, self.model_enc_seqlen), dtype=bool)
     enc_padding_mask[:, :2] = False
     padded_enc_input = np.full((self.model_max_bars, self.model_enc_seqlen), dtype=int, fill_value=self.pad_token)
     enc_lens = np.zeros((self.model_max_bars,))
 
-    for b, (st, ed) in enumerate(zip(bar_positions[:-1], bar_positions[1:])):
+    i = 0 # index to store tokens in encoder input
+    for bidx in range(st_bar, len(skyline_pos)):
+      st, ed = skyline_pos[bidx]
+
       enc_padding_mask[b, : (ed-st)] = False
       enc_lens[b] = ed - st
       within_bar_events = self.pad_sequence(bar_events[st : ed], self.model_enc_seqlen, self.pad_token)
       within_bar_events = np.array(within_bar_events)
-
-      padded_enc_input[b, :] = within_bar_events[:self.model_enc_seqlen]
+      # padded_enc_input[b, :] = within_bar_events[:self.model_enc_seqlen]
+      # truncate and padded
+      padded_enc_input[b, :] = within_bar_events[:(ed-st)]
 
     return padded_enc_input, enc_padding_mask, enc_lens
 
@@ -226,78 +250,73 @@ class REMIFullSongTransformerDataset(Dataset):
     if torch.is_tensor(idx):
       idx = idx.tolist()
 
-    bar_events, st_bar, bar_pos, enc_n_bars = self.get_sample_from_file(idx)
+    if not self.use_chord_mhot:
+      piece_events, skyline_pos, midi_pos, st_bar = self.get_sample_from_file(idx)
+      piece_chords = None
+    else:
+      piece_events, skyline_pos, midi_pos, piece_chords, st_bar = self.get_sample_from_file(idx)
+
     if self.do_augment:
-      bar_events = self.pitch_augment(bar_events)
+      piece_events = self.pitch_augment(piece_events)
 
-    if self.use_attr_cls:
-      polyph_cls, rfreq_cls = self.get_attr_classes(os.path.basename(self.pieces[idx]), st_bar)
-      polyph_cls_expanded = np.zeros((self.model_dec_seqlen,), dtype=int)
-      rfreq_cls_expanded = np.zeros((self.model_dec_seqlen,), dtype=int)
-      for i, (b_st, b_ed) in enumerate(zip(bar_pos[:-1], bar_pos[1:])):
-        polyph_cls_expanded[b_st:b_ed] = polyph_cls[i]
-        rfreq_cls_expanded[b_st:b_ed] = rfreq_cls[i]
+    if self.use_composer_cls:
+      composer = os.path.basename(self.pieces[idx]).replace('.pkl', '').split("_")[-1]
+      composer_cls = [composer_dict[composer]] * (len(skyline_pos)-st_bar)
+      composer_cls_expanded = np.full((self.model_dec_seqlen,), composer_cls)
     else:
-      polyph_cls, rfreq_cls = [0], [0]
-      polyph_cls_expanded, rfreq_cls_expanded = [0], [0]
+      composer_cls = [0]
+      composer_cls_expanede = [0]
+      
+    # print ('poly and rfreq', polyph_cls, rfreq_cls)
+    piece_tokens = convert_event(
+      [piece_events[0]] + piece_events[ self.piece_skyline_pos[idx][st_bar][0] : ], 
+      self.event2idx, to_ndarr=False
+    )
+    length = len(piece_tokens)
 
-    bar_tokens = convert_event(bar_events, self.event2idx, to_ndarr=False)
-    bar_pos = bar_pos.tolist() + [len(bar_tokens)]
-
-    enc_inp, enc_padding_mask, enc_lens = self.get_encoder_input_data(bar_pos, bar_tokens)
-
-    length = len(bar_tokens)
     if self.pad_to_same:
-      inp = self.pad_sequence(bar_tokens, self.model_dec_seqlen + 1) 
-    else:
-      inp = self.pad_sequence(bar_tokens, len(bar_tokens) + 1, pad_value=self.dec_end_pad_value)
-    target = np.array(inp[1:], dtype=int)
-    inp = np.array(inp[:-1], dtype=int)
-    assert len(inp) == len(target)
+      inp = self.pad_sequence(piece_tokens, self.model_dec_seqlen)
+      piece_chords = self.pad_chords(piece_chords, self.model_dec_seqlen)
+
+    inp = np.array(inp, dtype=int)
+
+    target, track_mask = self.make_target_and_mask(inp, skyline_pos, midi_pos, st_bar)
+    # piece_tokens.append( self.eos_token )
+
+    inp = inp[:self.model_dec_seqlen]
+    target = target[:self.model_dec_seqlen]
+    track_mask = track_mask[:self.model_dec_seqlen]
+
+    # get encoder input: only skyline
+    enc_inp, enc_padding_mask, enc_lens = self.make_encinp_and_mask(inp, skyline_pos, midi_pos, st_bar)
+    # deal with condition
+
+    
+    # if piece_chords is not None:
+    #   piece_chords = piece_chords[ : self.model_dec_seqlen]
+    # else:
+    #   piece_chords = 0
+
+    # print (bar_pos)
+    # print ('[no. {:06d}] len: {:4} | last: {}'.format(idx, len(bar_tokens), self.idx2event[ bar_tokens[-1] ]))
+
+    # target = np.array(inp[1:], dtype=int)
+    # inp = np.array(inp[:-1], dtype=int)
+    # assert len(inp) == len(target)
 
     return {
       'id': idx,
-      'piece_id': int(os.path.basename(self.pieces[idx]).replace('.pkl', '')),
+      'piece_id': os.path.basename(self.pieces[idx]).replace('.pkl', ''),
       'st_bar_id': st_bar,
-      'bar_pos': np.array(bar_pos, dtype=int),
+      'bar_pos': None, # see how this is used, possible skyline/midi pos
       'enc_input': enc_inp,
       'dec_input': inp[:self.model_dec_seqlen],
       'dec_target': target[:self.model_dec_seqlen],
-      'polyph_cls': polyph_cls_expanded,
-      'rhymfreq_cls': rfreq_cls_expanded,
-      'polyph_cls_bar': np.array(polyph_cls),
-      'rhymfreq_cls_bar': np.array(rfreq_cls),
+      'composer_cls': composer_cls_expanded,
+      'composer_cls_bar': np.array(polyph_cls),
+      'track_mask': track_mask,
       'length': min(length, self.model_dec_seqlen),
       'enc_padding_mask': enc_padding_mask,
       'enc_length': enc_lens,
-      'enc_n_bars': enc_n_bars
+      'enc_n_bars': len(skyline_pos)-st_bar #TODO: check this
     }
-
-if __name__ == "__main__":
-  # codes below are for unit test
-  dset = REMIFullSongTransformerDataset(
-    './remi_dataset', './pickles/remi_vocab.pkl', do_augment=True, use_attr_cls=True,
-    model_max_bars=16, model_dec_seqlen=1280, model_enc_seqlen=128, min_pitch=22, max_pitch=107
-  )
-  print (dset.bar_token, dset.pad_token, dset.vocab_size)
-  print ('length:', len(dset))
-
-  # for i in random.sample(range(len(dset)), 100):
-  # for i in range(len(dset)):
-  #   sample = dset[i]
-    # print (i, len(sample['bar_pos']), sample['bar_pos'])
-    # print (i)
-    # print ('******* ----------- *******')
-    # print ('piece: {}, st_bar: {}'.format(sample['piece_id'], sample['st_bar_id']))
-    # print (sample['enc_input'][:8, :16])
-    # print (sample['dec_input'][:16])
-    # print (sample['dec_target'][:16])
-    # print (sample['enc_padding_mask'][:32, :16])
-    # print (sample['length'])
-
-  dloader = DataLoader(dset, batch_size=4, shuffle=False, num_workers=24)
-  for i, batch in enumerate(dloader):
-    for k, v in batch.items():
-      if torch.is_tensor(v):
-        print (k, ':', v.dtype, v.size())
-    print ('=====================================\n')
