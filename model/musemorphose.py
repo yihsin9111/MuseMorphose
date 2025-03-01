@@ -34,6 +34,7 @@ class VAETransformerDecoder(nn.Module):
       self.cond_mode = 'in-attn'
     attn_mask = generate_causal_mask(x.size(0)).to(x.device)
     # print (attn_mask.size())
+    # print(seg_emb.shape())
 
     if self.cond_mode == 'in-attn':
       seg_emb = self.seg_emb_proj(seg_emb)
@@ -184,7 +185,8 @@ class MuseMorphose(nn.Module):
       # [shape of dec_inp_bar_pos] (bsize, n_bars_per_sample + 1)
       # -- stores [[start idx of bar #1, sample #1, ..., start idx of bar #K, sample #1, seqlen of sample #1], [same for another sample], ...]
       for b, (st, ed) in enumerate(zip(dec_inp_bar_pos[n, :-1], dec_inp_bar_pos[n, 1:])):
-        dec_seg_emb[st:ed, n, :] = vae_latent_reshaped[n, b, :]
+        if st != -1: # deal with input samples of different size
+          dec_seg_emb[st:ed, n, :] = vae_latent_reshaped[n, b, :]
 
     if rfreq_cls is not None and polyph_cls is not None and self.use_attr_cls:
       dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)

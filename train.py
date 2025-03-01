@@ -1,8 +1,9 @@
+
 import sys, os, time
 sys.path.append('./model')
 
 from model.musemorphose import MuseMorphose
-from dataloader import REMIFullSongTransformerDataset
+from dataloader import REMISkylineToMidiVAEDataset
 from torch.utils.data import DataLoader
 
 from utils import pickle_load
@@ -80,15 +81,14 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched):
     batch_inp_bar_pos = batch_samples['bar_pos'].to(device)
     batch_inp_lens = batch_samples['length']
     batch_padding_mask = batch_samples['enc_padding_mask'].to(device)
-    batch_rfreq_cls = batch_samples['rhymfreq_cls'].permute(1, 0).to(device)
-    batch_polyph_cls = batch_samples['polyph_cls'].permute(1, 0).to(device)
-
+    batch_composer_cls = batch_samples['composer_cls'].permute(1, 0).to(device)
+    
     global trained_steps
     trained_steps += 1
 
     mu, logvar, dec_logits = model(
       batch_enc_inp, batch_dec_inp, 
-      batch_inp_bar_pos, batch_rfreq_cls, batch_polyph_cls,
+      batch_inp_bar_pos, batch_composer_cls,
       padding_mask=batch_padding_mask
     )
 
@@ -175,7 +175,7 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched):
     os.path.join(ckpt_dir, 'log.txt'), log_data, is_init=not os.path.exists(os.path.join(ckpt_dir, 'log.txt'))
   )
 
-def validate(model, dloader, n_rounds=8, use_attr_cls=True):
+def validate(model, dloader, n_rounds=8, use_attr_cls=False):
   model.eval()
   loss_rec = []
   kl_loss_rec = []
@@ -216,18 +216,18 @@ def validate(model, dloader, n_rounds=8, use_attr_cls=True):
   return loss_rec, kl_loss_rec
 
 if __name__ == "__main__":
-  dset = REMIFullSongTransformerDataset(
+  dset = REMISkylineToMidiVAEDataset(
     config['data']['data_dir'], config['data']['vocab_path'], 
-    do_augment=True, 
+    do_augment=True, use_composer_cls = False,
     model_enc_seqlen=config['data']['enc_seqlen'], 
     model_dec_seqlen=config['data']['dec_seqlen'], 
     model_max_bars=config['data']['max_bars'],
     pieces=pickle_load(config['data']['train_split']),
     pad_to_same=True
   )
-  dset_val = REMIFullSongTransformerDataset(
+  dset_val = REMISkylineToMidiVAEDataset(
     config['data']['data_dir'], config['data']['vocab_path'], 
-    do_augment=False, 
+    do_augment=False, use_composer_cls = False,
     model_enc_seqlen=config['data']['enc_seqlen'], 
     model_dec_seqlen=config['data']['dec_seqlen'], 
     model_max_bars=config['data']['max_bars'],
@@ -245,7 +245,7 @@ if __name__ == "__main__":
     mconf['dec_n_layer'], mconf['dec_n_head'], mconf['dec_d_model'], mconf['dec_d_ff'],
     mconf['d_latent'], mconf['d_embed'], dset.vocab_size,
     d_polyph_emb=mconf['d_polyph_emb'], d_rfreq_emb=mconf['d_rfreq_emb'],
-    cond_mode=mconf['cond_mode']
+    cond_mode=mconf['cond_mode'], use_attr_cls = False
   ).to(device)
   if pretrained_params_path:
     model.load_state_dict( torch.load(pretrained_params_path) )

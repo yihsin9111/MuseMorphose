@@ -86,21 +86,23 @@ def convert_event(event_seq, event2idx, to_ndarr=True):
     return event_seq
 
 class REMISkylineToMidiVAEDataset(Dataset):
-  def __init__(self, data_dir, vocab_file, 
-               model_dec_seqlen=10240, model_max_bars=None,
+  def __init__(self, data_dir, vocab_file, model_enc_seqlen=128,
+               model_dec_seqlen=1280, model_max_bars=None,
                pieces=[], do_augment=True, augment_range=range(-6, 7), 
                min_pitch=21, max_pitch=108, pad_to_same=True,
                appoint_st_bar=None, dec_end_pad_value=None,
-               use_chord_mhot=False
+               use_chord_mhot=False, use_composer_cls=False
               ):
     self.vocab_file = vocab_file
     self.read_vocab()
 
+    self.model_enc_seqlen = model_enc_seqlen
     self.model_dec_seqlen = model_dec_seqlen
     self.model_max_bars = model_max_bars
     self.data_dir = data_dir
     self.pieces = pieces
     self.use_chord_mhot = use_chord_mhot
+    self.use_composer_cls = use_composer_cls
     self.build_dataset()
 
     self.do_augment = do_augment
@@ -144,16 +146,21 @@ class REMISkylineToMidiVAEDataset(Dataset):
       self.piece_skyline_pos.append(skyline_pos)
       self.piece_midi_pos.append(midi_pos)
 
-      if len(piece_evs) <= self.model_dec_seqlen:
+      # bottleneck in this case becomes model max bars
+      if len(skyline_pos) <= self.model_max_bars:
         self.piece_admissible_stbars.append([0])
       else:
-        _admissible_stbars = []
-        for bar in range(len(self.piece_skyline_pos[-1])):
-          if len(piece_evs) - self.piece_skyline_pos[-1][bar][0] >= 0.5 * self.model_dec_seqlen:
-            _admissible_stbars.append(bar)
-          else:
-            break
-        self.piece_admissible_stbars.append(_admissible_stbars)
+        self.piece_admissible_stbars.append([len(self.piece_skyline_pos[-1])-self.model_max_bars])
+      # if len(piece_evs) <= self.model_dec_seqlen:
+      #   self.piece_admissible_stbars.append([0])
+      # else:
+      #   _admissible_stbars = []
+      #   for bar in range(len(self.piece_skyline_pos[-1])):
+      #     if len(piece_evs) - self.piece_skyline_pos[-1][bar][0] >= 0.5 * self.model_dec_seqlen:
+      #       _admissible_stbars.append(bar)
+      #     else:
+      #       break
+        # self.piece_admissible_stbars.append(_admissible_stbars)
 
   def get_sample_from_file(self, piece_idx):
     if self.use_chord_mhot:
@@ -223,23 +230,24 @@ class REMISkylineToMidiVAEDataset(Dataset):
   def make_encinp_and_mask(self, inp_tokens, skyline_pos, midi_pos, st_bar):
     # encoder input and mask is in shape [# of bars, encode seq length]
     # pad midi part of the original sequence (assume already truncated)
-    assert len(bar_positions) == self.model_max_bars + 1
+    # assert len(bar_positions) == self.model_max_bars + 1
     enc_padding_mask = np.ones((self.model_max_bars, self.model_enc_seqlen), dtype=bool)
     enc_padding_mask[:, :2] = False
     padded_enc_input = np.full((self.model_max_bars, self.model_enc_seqlen), dtype=int, fill_value=self.pad_token)
     enc_lens = np.zeros((self.model_max_bars,))
 
     i = 0 # index to store tokens in encoder input
+    # print(st_bar, len(skyline_pos))
     for bidx in range(st_bar, len(skyline_pos)):
       st, ed = skyline_pos[bidx]
-
-      enc_padding_mask[b, : (ed-st)] = False
-      enc_lens[b] = ed - st
-      within_bar_events = self.pad_sequence(bar_events[st : ed], self.model_enc_seqlen, self.pad_token)
+      enc_padding_mask[i, : (ed-st)] = False
+      enc_lens[i] = ed - st
+      within_bar_events = self.pad_sequence(list(inp_tokens[st : ed]), self.model_enc_seqlen, self.pad_token)
       within_bar_events = np.array(within_bar_events)
       # padded_enc_input[b, :] = within_bar_events[:self.model_enc_seqlen]
       # truncate and padded
-      padded_enc_input[b, :] = within_bar_events[:(ed-st)]
+      padded_enc_input[i, :] = within_bar_events[:self.model_enc_seqlen]
+      i += 1
 
     return padded_enc_input, enc_padding_mask, enc_lens
 
@@ -265,7 +273,7 @@ class REMISkylineToMidiVAEDataset(Dataset):
       composer_cls_expanded = np.full((self.model_dec_seqlen,), composer_cls)
     else:
       composer_cls = [0]
-      composer_cls_expanede = [0]
+      composer_cls_expanded = [0]
       
     # print ('poly and rfreq', polyph_cls, rfreq_cls)
     piece_tokens = convert_event(
@@ -303,20 +311,75 @@ class REMISkylineToMidiVAEDataset(Dataset):
     # target = np.array(inp[1:], dtype=int)
     # inp = np.array(inp[:-1], dtype=int)
     # assert len(inp) == len(target)
+    bar_pos = np.full((self.model_max_bars),-1)
+    bar_pos_input = [st for (st,ed) in skyline_pos[st_bar:]]
+    bar_pos[:len(bar_pos_input)] = bar_pos_input
+    # print(len(bar_pos))
 
     return {
       'id': idx,
       'piece_id': os.path.basename(self.pieces[idx]).replace('.pkl', ''),
       'st_bar_id': st_bar,
-      'bar_pos': None, # see how this is used, possible skyline/midi pos
+      'bar_pos': bar_pos, # see how this is used, possible skyline/midi pos
       'enc_input': enc_inp,
       'dec_input': inp[:self.model_dec_seqlen],
       'dec_target': target[:self.model_dec_seqlen],
-      'composer_cls': composer_cls_expanded,
-      'composer_cls_bar': np.array(polyph_cls),
+      'composer_cls': np.array(composer_cls_expanded),
+      'composer_cls_bar': np.array(composer_cls),
       'track_mask': track_mask,
       'length': min(length, self.model_dec_seqlen),
       'enc_padding_mask': enc_padding_mask,
       'enc_length': enc_lens,
       'enc_n_bars': len(skyline_pos)-st_bar #TODO: check this
     }
+
+import yaml
+from torch.utils.data import DataLoader
+config_path = "/home/yihsin/MidiStyleTransfer/MuseMorphose/config/skyline.yaml"
+config = yaml.load(open(config_path, 'r'), Loader=yaml.FullLoader)
+
+if __name__ == "__main__":
+  # codes below are for unit test
+
+  dset = REMISkylineToMidiVAEDataset(
+      config['data']['data_dir'], config['data']['vocab_path'], 
+      do_augment=True, use_composer_cls = False,
+      model_enc_seqlen=config['data']['enc_seqlen'], 
+      model_dec_seqlen=config['data']['dec_seqlen'], 
+      model_max_bars=config['data']['max_bars'],
+      pieces=pickle_load(config['data']['val_split']),
+      pad_to_same=True
+  )
+  print (dset.bar_token, dset.pad_token, dset.vocab_size)
+  print ('length:', len(dset))
+
+  # for i in random.sample(range(len(dset)), 100):
+  # for i in range(len(dset)):
+  #   sample = dset[i]
+    # print (i, len(sample['bar_pos']), sample['bar_pos'])
+    # print (i)
+    # print ('******* ----------- *******')
+    # print ('piece: {}, st_bar: {}'.format(sample['piece_id'], sample['st_bar_id']))
+    # print (sample['enc_input'][:8, :16])
+    # print (sample['dec_input'][:16])
+    # print (sample['dec_target'][:16])
+    # print (sample['enc_padding_mask'][:32, :16])
+    # print (sample['length'])
+
+  dloader = DataLoader(dset, batch_size=4, shuffle=False, num_workers=24)
+  device = "cuda"
+  for i, batch_samples in enumerate(dloader):
+    # for k, v in batch.items():
+    #   if torch.is_tensor(v):
+    #     print (k, ':', v.dtype, v.size())
+    # print ('=====================================\n')
+    batch_enc_inp = batch_samples['enc_input'].permute(2, 0, 1).to(device)
+    batch_dec_inp = batch_samples['dec_input'].permute(1, 0).to(device)
+    batch_dec_tgt = batch_samples['dec_target'].permute(1, 0).to(device)
+    batch_inp_bar_pos = batch_samples['bar_pos'].to(device)
+    batch_inp_lens = batch_samples['length']
+    batch_padding_mask = batch_samples['enc_padding_mask'].to(device)
+    batch_composer_cls = batch_samples['composer_cls'].permute(1, 0).to(device)
+    break
+
+
