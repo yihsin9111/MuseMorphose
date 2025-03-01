@@ -128,6 +128,7 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched):
         'kldiv_raw': kl_raw_ema,
         'time': time.time() - st
       }
+      wandb.log(log_data)
       log_epoch(
         os.path.join(ckpt_dir, 'log.txt'), log_data, is_init=not os.path.exists(os.path.join(ckpt_dir, 'log.txt'))
       )
@@ -142,6 +143,13 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched):
           np.mean(vallosses[0]),
           np.mean(vallosses[1])
         ))
+        wandb.log({
+          "steps": trained_steps, 
+          "recons_loss_ema": recons_loss_ema, 
+          "kl_raw_ema": kl_raw_ema,
+          "val_RC": np.mean(vallosses[0]),
+          "val_KL": np.mean(vallosses[1])
+        })
       model.train()
 
     if not trained_steps % ckpt_interval:
@@ -171,6 +179,7 @@ def train_model(epoch, model, dloader, dloader_val, optim, sched):
     'kldiv_raw': kl_raw_ema,
     'time': time.time() - st
   }
+
   log_epoch(
     os.path.join(ckpt_dir, 'log.txt'), log_data, is_init=not os.path.exists(os.path.join(ckpt_dir, 'log.txt'))
   )
@@ -214,6 +223,14 @@ def validate(model, dloader, n_rounds=8, use_attr_cls=False):
         kl_loss_rec.append(losses['kldiv_raw'].item())
     
   return loss_rec, kl_loss_rec
+
+
+import wandb
+wandb.login()
+run = wandb.init(
+    # Set the project where this run will be logged
+    project="musemorphose-skyline",
+)
 
 if __name__ == "__main__":
   dset = REMISkylineToMidiVAEDataset(
