@@ -286,7 +286,7 @@ class REMISkylineToMidiVAEDataset(Dataset):
       inp = self.pad_sequence(piece_tokens, self.model_dec_seqlen)
       piece_chords = self.pad_chords(piece_chords, self.model_dec_seqlen)
 
-    inp = np.array(inp, dtype=int)
+    inp = np.array(inp, dtype=int) # this is the version of full song... :'( its okay to test
 
     target, track_mask = self.make_target_and_mask(inp, skyline_pos, midi_pos, st_bar)
     # piece_tokens.append( self.eos_token )

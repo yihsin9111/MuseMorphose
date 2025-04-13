@@ -2,11 +2,11 @@ import sys, os, random, time
 from copy import deepcopy
 sys.path.append('./model')
 
-from dataloader import REMIFullSongTransformerDataset
+from dataloader import REMISkylineToMidiVAEDataset
 from model.musemorphose import MuseMorphose
 
 from utils import pickle_load, numpy_to_tensor, tensor_to_numpy
-from remi2midi import remi2midi
+# from remi2midi import remi2midi
 
 import torch
 import yaml
@@ -30,7 +30,7 @@ n_samples_per_piece = int(sys.argv[5])
 # little helpers
 ###########################################
 def word2event(word_seq, idx2event):
-  return [ idx2event[w] for w in word_seq ]
+  return [ idx2event[w] for w in word_seq if w<len(idx2event) ]
 
 def get_beat_idx(event):
   return int(event.split('_')[-1])
@@ -193,14 +193,23 @@ def random_shift_attr_cls(n_samples, upper=4, lower=-3):
 
 
 if __name__ == "__main__":
-  dset = REMIFullSongTransformerDataset(
-    data_dir, vocab_path, 
-    do_augment=False,
+  # dset = REMIFullSongTransformerDataset(
+  #   data_dir, vocab_path, 
+  #   do_augment=False,
+  #   model_enc_seqlen=config['data']['enc_seqlen'], 
+  #   model_dec_seqlen=config['generate']['dec_seqlen'],
+  #   model_max_bars=config['generate']['max_bars'],
+  #   pieces=pickle_load(data_split),
+  #   pad_to_same=False
+  # )
+  dset = REMISkylineToMidiVAEDataset(
+    config['data']['data_dir'], config['data']['vocab_path'], 
+    do_augment=True, use_composer_cls = False,
     model_enc_seqlen=config['data']['enc_seqlen'], 
-    model_dec_seqlen=config['generate']['dec_seqlen'],
-    model_max_bars=config['generate']['max_bars'],
-    pieces=pickle_load(data_split),
-    pad_to_same=False
+    model_dec_seqlen=config['data']['dec_seqlen'], 
+    model_max_bars=config['data']['max_bars'],
+    pieces=pickle_load(config['data']['val_split']),
+    pad_to_same=True
   )
   pieces = random.sample(range(len(dset)), n_pieces)
   print ('[sampled pieces]', pieces)
@@ -211,7 +220,7 @@ if __name__ == "__main__":
     mconf['dec_n_layer'], mconf['dec_n_head'], mconf['dec_d_model'], mconf['dec_d_ff'],
     mconf['d_latent'], mconf['d_embed'], dset.vocab_size,
     d_polyph_emb=mconf['d_polyph_emb'], d_rfreq_emb=mconf['d_rfreq_emb'],
-    cond_mode=mconf['cond_mode']
+    cond_mode=mconf['cond_mode'], use_attr_cls = False
   ).to(device)
   model.eval()
   model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
@@ -228,25 +237,29 @@ if __name__ == "__main__":
     p_data['enc_input'] = p_data['enc_input'][ : p_data['enc_n_bars'] ]
     p_data['enc_padding_mask'] = p_data['enc_padding_mask'][ : p_data['enc_n_bars'] ]
 
-    orig_p_cls_str = ''.join(str(c) for c in p_data['polyph_cls_bar'])
-    orig_r_cls_str = ''.join(str(c) for c in p_data['rhymfreq_cls_bar'])
+    # orig_p_cls_str = ''.join(str(c) for c in p_data['polyph_cls_bar'])
+    # orig_r_cls_str = ''.join(str(c) for c in p_data['rhymfreq_cls_bar'])
 
     orig_song = p_data['dec_input'].tolist()[:p_data['length']]
-    orig_song = word2event(orig_song, dset.idx2event)
+
     orig_out_file = os.path.join(out_dir, 'id{}_bar{}_orig'.format(
         p, p_bar_id
     ))
     print ('[info] writing to ...', orig_out_file)
+    np.save(orig_out_file + '_orig.npy', np.array(orig_song))
+
+    orig_song = word2event(orig_song, dset.idx2event)
+    
     # output reference song's MIDI
-    _, orig_tempo = remi2midi(orig_song, orig_out_file + '.mid', return_first_tempo=True, enforce_tempo=False)
+    # _, orig_tempo = remi2midi(orig_song, orig_out_file + '.mid', return_first_tempo=True, enforce_tempo=False)
 
     # save metadata of reference song (events & attr classes)
     print (*orig_song, sep='\n', file=open(orig_out_file + '.txt', 'a'))
-    np.save(orig_out_file + '-POLYCLS.npy', p_data['polyph_cls_bar'])
-    np.save(orig_out_file + '-RHYMCLS.npy', p_data['rhymfreq_cls_bar'])
-
+    # np.save(orig_out_file + '-POLYCLS.npy', p_data['polyph_cls_bar'])
+    # np.save(orig_out_file + '-RHYMCLS.npy', p_data['rhymfreq_cls_bar'])
 
     for k in p_data.keys():
+      if type(p_data[k])==str: continue
       if not torch.is_tensor(p_data[k]):
         p_data[k] = numpy_to_tensor(p_data[k], device=device)
       else:
@@ -257,19 +270,19 @@ if __name__ == "__main__":
                   use_sampling=config['generate']['use_latent_sampling'],
                   sampling_var=config['generate']['latent_sampling_var']
                 )
-    p_cls_diff = random_shift_attr_cls(n_samples_per_piece)
-    r_cls_diff = random_shift_attr_cls(n_samples_per_piece)
+    # p_cls_diff = random_shift_attr_cls(n_samples_per_piece)
+    c_cls_diff = random_shift_attr_cls(n_samples_per_piece)
 
     piece_entropies = []
     for samp in range(n_samples_per_piece):
-      p_polyph_cls = (p_data['polyph_cls_bar'] + p_cls_diff[samp]).clamp(0, 7).long()
-      p_rfreq_cls = (p_data['rhymfreq_cls_bar'] + r_cls_diff[samp]).clamp(0, 7).long()
+      p_composer_cls = (p_data['composer_cls'] + c_cls_diff[samp]).clamp(0, 7).long()
+      # p_rfreq_cls = (p_data['rhymfreq_cls_bar'] + r_cls_diff[samp]).clamp(0, 7).long()
 
       print ('[info] piece: {}, bar: {}'.format(p_id, p_bar_id))
-      out_file = os.path.join(out_dir, 'id{}_bar{}_sample{:02d}_poly{}_rhym{}'.format(
+      out_file = os.path.join(out_dir, 'id{}_bar{}_sample{:02d}'.format(
         p, p_bar_id, samp + 1,
-        '+{}'.format(p_cls_diff[samp]) if p_cls_diff[samp] >= 0 else p_cls_diff[samp], 
-        '+{}'.format(r_cls_diff[samp]) if r_cls_diff[samp] >= 0 else r_cls_diff[samp]
+        # '+{}'.format(p_cls_diff[samp]) if p_cls_diff[samp] >= 0 else p_cls_diff[samp], 
+        # '+{}'.format(r_cls_diff[samp]) if r_cls_diff[samp] >= 0 else r_cls_diff[samp]
       ))      
       print ('[info] writing to ...', out_file)
       if os.path.exists(out_file + '.txt'):
@@ -280,22 +293,25 @@ if __name__ == "__main__":
 
       # generate
       song, t_sec, entropies = generate_on_latent_ctrl_vanilla_truncate(
-                                  model, p_latents, p_rfreq_cls, p_polyph_cls, dset.event2idx, dset.idx2event,
+                                  model, p_latents, p_composer_cls, p_composer_cls, dset.event2idx, dset.idx2event,
                                   max_input_len=config['generate']['max_input_dec_seqlen'], 
                                   truncate_len=min(512, config['generate']['max_input_dec_seqlen'] - 32), 
                                   nucleus_p=config['generate']['nucleus_p'], 
                                   temperature=config['generate']['temperature'],
-                                  
                                 )
       times.append(t_sec)
-
-      song = word2event(song, dset.idx2event)
-      print (*song, sep='\n', file=open(out_file + '.txt', 'a'))
-      remi2midi(song, out_file + '.mid', enforce_tempo=True, enforce_tempo_val=orig_tempo)
+      print("saving generated tensor...")
+      print(type(song), song[:10])
+      np.save(out_file + '-result.npy', tensor_to_numpy(song)) 
+      
+      # song = word2event(song, dset.idx2event)
+      # print (*song, sep='\n', file=open(out_file + '.txt', 'a'))
+      # remi2midi(song, out_file + '.mid', enforce_tempo=True, enforce_tempo_val=orig_tempo)
 
       # save metadata of the generation
-      np.save(out_file + '-POLYCLS.npy', tensor_to_numpy(p_polyph_cls))
-      np.save(out_file + '-RHYMCLS.npy', tensor_to_numpy(p_rfreq_cls))
+      # np.save(out_file + '-POLYCLS.npy', tensor_to_numpy(p_polyph_cls))
+      # np.save(out_file + '-RHYMCLS.npy', tensor_to_numpy(p_rfreq_cls))
+      
       print ('[info] piece entropy: {:.4f} (+/- {:.4f})'.format(
         entropies.mean(), entropies.std()
       ))

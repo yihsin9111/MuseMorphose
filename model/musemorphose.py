@@ -139,12 +139,12 @@ class MuseMorphose(nn.Module):
     token_emb = self.token_emb(inp)
     dec_inp = self.emb_dropout(token_emb) + self.pe(inp.size(0))
 
-    if rfreq_cls is not None and polyph_cls is not None:
-      dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
-      dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
-      dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
-    else:
-      dec_seg_emb_cat = dec_seg_emb
+    # if rfreq_cls is not None and polyph_cls is not None:
+    #   dec_rfreq_emb = self.rfreq_attr_emb(rfreq_cls)
+    #   dec_polyph_emb = self.polyph_attr_emb(polyph_cls)
+    #   dec_seg_emb_cat = torch.cat([dec_seg_emb, dec_rfreq_emb, dec_polyph_emb], dim=-1)
+    # else:
+    dec_seg_emb_cat = dec_seg_emb
 
     out = self.decoder(dec_inp, dec_seg_emb_cat)
     out = self.dec_out_proj(out)
